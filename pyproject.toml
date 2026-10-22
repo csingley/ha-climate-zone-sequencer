@@ -1,8 +1,17 @@
+[dependency-groups]
+dev = [
+    "mypy",
+    "pytest",
+    "pytest-homeassistant-custom-component",
+    "ruff",
+]
+
 [tool.mypy]
 files = ["custom_components", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
