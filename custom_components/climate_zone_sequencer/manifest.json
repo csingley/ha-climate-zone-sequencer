@@ -1,0 +1,9 @@
+{
+  "domain": "climate_zone_sequencer",
+  "name": "Climate Zone Sequencer",
+  "documentation": "https://github.com/csingley/ha-climate-zone-sequencer",
+  "codeowners": ["@csingley"],
+  "requirements": [],
+  "version": "0.1.0",
+  "iot_class": "calculated"
+}
