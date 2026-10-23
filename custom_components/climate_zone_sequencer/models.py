@@ -1,8 +1,8 @@
 """Core domain types and decision logic for climate-zone-sequencer.
 
-A Zone's demand and liveness both derive from its own observation
-history, with no separately-mutated state. Sequencer arbitrates a
-shared, mode-exclusive plant from a fixed collection of Zones.
+Zones are seen only through observations, and each derives its current
+Vote from the latest one. Sequencer picks one shared Mode from the votes
+of a fixed collection of Zones, debounced against short-cycling.
 """
 
 from __future__ import annotations
@@ -28,54 +28,81 @@ class Mode(str, enum.Enum):
     COOL = "cool"
 
 
-@dataclasses.dataclass(frozen=True)
-class ZoneEvent:
-    """One confirmed-alive observation of a zone, at an instant.
+@enum.unique
+class Status(str, enum.Enum):
+    """How far a Zone's vote can be trusted right now."""
 
-    A failed probe produces no event -- staleness is derived from the
-    gap since the latest one (Zone.ready()), never stored as an event.
+    LIVE = "live"
+    STALE = "stale"  # out of sight, last-known vote still within last_known_ttl
+    EXPIRED = "expired"  # out of sight for longer than last_known_ttl
+    UNKNOWN = "unknown"  # never seen
+
+
+@dataclasses.dataclass(frozen=True)
+class Vote:
+    """What a Zone wants, and how it ranks against the others.
+
+    Attributes:
+        want: None for no active want.
+        rank: Opaque; lower sorts first. Meaning is up to the caller.
     """
 
-    timestamp: float
-    mode: Mode | None
+    want: Mode | None
+    rank: Orderable
 
 
 class Zone:
-    """One zone's demand and liveness, derived from its own history.
+    """One zone, seen only through observations.
 
-    priority is config, not observation, so it's a plain mutable
-    attribute rather than part of the event log. id also tie-breaks
-    equal priorities.
+    Out of sight, a Zone keeps its last-known vote for last_known_ttl: it
+    may still be running that want, and can't be influenced either way, so
+    dropping it would let a sibling contend blind. Past the TTL it lapses.
+
+    Args:
+        id: This zone's identity; also the tie-break between equal ranks.
+        last_known_ttl: How long a lost zone's last-known vote still counts.
     """
 
-    def __init__(self, id: int, *, priority: Orderable, ready_timeout: timedelta) -> None:
+    def __init__(self, id: int, *, last_known_ttl: timedelta) -> None:
         self.id = id
-        self.priority = priority
-        self.ready_timeout = ready_timeout.total_seconds()
-        self._events: list[ZoneEvent] = []
+        self.last_known_ttl = last_known_ttl.total_seconds()
+        self._vote: Vote | None = None
+        self._lost_since: float | None = None
 
-    def record(self, mode: Mode | None, now: float) -> None:
-        """Append a confirmed-alive observation (mode=None means idle)."""
-        self._events.append(ZoneEvent(timestamp=now, mode=mode))
+    def observe(self, want: Mode | None, rank: Orderable) -> None:
+        """Record what the zone wants, seen just now."""
+        self._vote = Vote(want, rank)
+        self._lost_since = None
 
-    @property
-    def mode(self) -> Mode | None:
-        """This zone's most recently observed want."""
-        return self._events[-1].mode if self._events else None
+    def lost(self, now: float) -> None:
+        """Record that the zone can't be seen; the TTL runs from the first call."""
+        if self._lost_since is None:
+            self._lost_since = now
 
-    def ready(self, now: float) -> bool:
-        """True if this zone has been observed within ready_timeout."""
-        if not self._events:
-            return False
-        return now - self._events[-1].timestamp <= self.ready_timeout
+    def status(self, now: float) -> Status:
+        if self._vote is None:
+            return Status.UNKNOWN
+        if self._lost_since is None:
+            return Status.LIVE
+        if now - self._lost_since <= self.last_known_ttl:
+            return Status.STALE
+        return Status.EXPIRED
+
+    def vote(self, now: float) -> Vote | None:
+        """The vote that counts right now, if any."""
+        return self._vote if self.status(now) in (Status.LIVE, Status.STALE) else None
 
 
 class Sequencer:
-    """Selects one shared Mode for a fixed collection of Zones, debounced
-    against short-cycling.
+    """Picks one shared Mode from a fixed collection of Zones' votes,
+    debounced against short-cycling.
 
-    Holds the current Mode if any Zone isn't ready -- an untrusted Zone
-    may be silently asserting a conflicting want we can't see.
+    Args:
+        zones: Fixed roster for the lifetime of this Sequencer.
+        min_cycle_duration: Minimum time between Mode flips.
+        initial: Mode to start in.
+        default_mode: Mode to fall back to when no zone has a want.
+                      Defaults to holding the current Mode.
     """
 
     def __init__(
@@ -103,15 +130,20 @@ class Sequencer:
         """
         self._mode = mode
 
-    def evaluate(self, now: float) -> Mode:
-        """Recompute and return the current Mode from the live Zones."""
-        if not all(zone.ready(now) for zone in self.zones.values()):
-            return self._mode
+    def change_allowed(self, now: float) -> bool:
+        return self._last_change is None or now - self._last_change >= self.min_cycle_duration
 
-        active = (zone for zone in self.zones.values() if zone.mode is not None)
-        wanted = [
-            zone.mode for zone in sorted(active, key=lambda z: (z.priority, z.id))
-        ]
+    def seconds_since_change(self, now: float) -> float | None:
+        return None if self._last_change is None else now - self._last_change
+
+    def evaluate(self, now: float) -> Mode:
+        """Recompute and return the current Mode from the Zones' votes."""
+        contenders: list[tuple[Orderable, int, Mode]] = []
+        for zone in self.zones.values():
+            vote = zone.vote(now)
+            if vote is not None and vote.want is not None:
+                contenders.append((vote.rank, zone.id, vote.want))
+        wanted = [want for _, _, want in sorted(contenders, key=lambda c: (c[0], c[1]))]
 
         match list(set(wanted)):
             case []:
@@ -119,13 +151,9 @@ class Sequencer:
             case [mode]:
                 proposed = mode
             case _:
-                proposed = wanted[0]  # contention: highest priority wins
+                proposed = wanted[0]  # contention: highest rank wins
 
-        allowed = (
-            self._last_change is None
-            or now - self._last_change >= self.min_cycle_duration
-        )
-        if proposed != self._mode and allowed:
+        if proposed != self._mode and self.change_allowed(now):
             self._mode = proposed
             self._last_change = now
 
